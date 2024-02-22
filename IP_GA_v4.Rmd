@@ -1,0 +1,760 @@
+---
+title: "IP Genetic Algorithm"
+output: html_document
+date: "2023-03-08"
+---
+
+### Libraries
+```{r, setup}
+# libraries
+library(priceR)
+library(lubridate)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(cvar)
+library(GA)
+library(glue)
+library(plotly)
+library(moments)
+library(gganimate)
+library(reshape2)
+library(gifski)
+```
+
+### Preparing the Data
+```{r}
+# Load exposure and cost of hedge data
+exposures = read.csv("Exposures.csv")
+points = read.csv("Forward Points.csv")
+```
+
+```{r}
+# Convert Market Convention format from XXX/YYY to XXX.YYY
+exposures$Market.Convention = paste(substr(exposures$Market.Convention,1,3),'.',
+                                    substr(exposures$Market.Convention,5,7), 
+                                    sep = '')
+```
+
+```{r}
+# Using historical cost of hedge data, we identify which exposures cannot be hedged
+# It is assumed that if no historical transactions exist for a currency pair, no market exists to hedge that pair
+not_t = setdiff(paste(substr(exposures$Market.Convention,1,3),substr(exposures$Market.Convention,5,7)),
+                     paste(substr(points$CCY.Pair,1,3),substr(points$CCY.Pair,5,7)))
+
+not_traded = c()
+for (i in not_t) {
+  not_traded = append(not_traded, paste(substr(i,1,3),'.',substr(i,5,7), sep = ''))
+}
+```
+
+```{r}
+# filter exposures to remove those which cannot be hedged or those with exposure value of zero
+exposures = filter(exposures, !Market.Convention %in% not_traded, Amount != 0)
+```
+
+```{r}
+for (i in 1:nrow(exposures)) {
+  if (exposures[i, "Amount"] < 0) {
+  exposures[i,"FromCurr"] = exposures[i,"Func"]
+  exposures[i,"ToCurr"] = exposures[i,"Exp"]
+  }
+  else {
+    exposures[i,"FromCurr"] = exposures[i,"Exp"]
+  exposures[i,"ToCurr"] = exposures[i,"Func"]
+  }
+}
+```
+
+```{r}
+# Identify unique combinations of CCY.Pair, Dealt.CCY, and B.S
+combos = unique(points[,c('CCY.Pair', 'Dealt.CCY', 'B.S')])
+
+# Create a list consisting of the cost of hedge for each unique combination from above
+# The mean cost of hedge across all historical transactions was used as the "cost of hedge"
+point_list = c()
+for (i in 1:nrow(combos)) {
+  filtered = filter(points, CCY.Pair == combos[i,'CCY.Pair'], Dealt.CCY == combos[i,'Dealt.CCY'], B.S == combos[i,'B.S'])
+  point_list[[paste(combos[i,'CCY.Pair'],combos[i,'Dealt.CCY'],combos[i,'B.S'])]] = mean(filtered$Pts)
+}
+```
+
+```{r}
+# Set the data as of when the hedging activity would have been done
+# In production, use Sys.Date() 
+date = as.Date("2022-09-16")
+# date = Sys.Date()
+```
+
+```{r}
+# Identify the unique currencies in which the exposures are originally denominated 
+exp_cur = unique(exposures$Exp)
+
+# pull the historical exchange rates between exposure and USD
+exp.usd.rates = c()
+for (i in exp_cur){
+
+  rate = historical_exchange_rates(from = i, 
+                                   to = "USD", 
+                                   start_date = date, 
+                                   end_date = date)
+  
+  # Append the rate value to the rates list
+  exp.usd.rates[i] = rate[,2]
+}
+
+# create a df to merge on 'from'
+exp.usd = as.data.frame(exp.usd.rates)
+exp.usd = cbind(from = rownames(exp.usd), exp.usd)
+rownames(exp.usd) = 1:nrow(exp.usd)
+```
+
+```{r}
+# merge exposures with cur.usd on the 'Exp' and 'from' columns
+exposures = full_join(exposures, exp.usd, by = join_by(Exp == from))
+```
+
+```{r}
+# create a column named expusd that adjusts the exposures to USD
+exposures$expusd = (exposures$Amount*exposures$exp.usd.rates)
+```
+
+```{r}
+# create a weights column that identifies the weight of the exposed currency pair in the balance sheet in USD
+exposures$weight = exposures$expusd / sum(exposures$expusd)
+
+weights = exposures$weight
+```
+
+```{r}
+# Populate the cost of hedge, hedge notional amount, hedge currency, and transaction type for each exposure
+exposures$Pts = NA
+
+# First look for the "logical" hedge, a direct offset to the exposure 
+# (i.e. if short a currency, buy the exposure vs. the functional)
+for (i in 1:nrow(exposures)) {
+  if (exposures[i,'Amount'] < 0) {
+    pts = point_list[[paste(exposures[i,'Market.Convention'],exposures[i,'Exp'],'Buy')]]
+    if (length(pts) > 0) {
+      exposures[i,'Pts'] = pts
+      exposures[i,'HedgeNotional'] = abs(exposures[i,"Amount"])
+      exposures[i, "TransType"] = "Buy"
+      exposures[i, "HedgeCurrency"] = exposures[i,'Exp']
+    }
+  }
+  else {
+    pts = point_list[[paste(exposures[i,'Market.Convention'],exposures[i,'Exp'],'Sell')]]
+    if (length(pts) > 0) {
+      exposures[i,'Pts'] = pts
+      exposures[i,'HedgeNotional'] = abs(exposures[i,"Amount"])
+      exposures[i, "TransType"] = "Sell"
+      exposures[i, "HedgeCurrency"] = exposures[i,'Exp']
+  }
+  }
+}
+
+# If the "logical" hedge doesn't exist, look for the opposite transaction 
+# (i.e. if short a currency, sell the functional vs. the exposure)
+for (i in 1:nrow(exposures)) {
+  if (is.na(exposures[i,'Pts'])) {
+    ex_rate = historical_exchange_rates(from = exposures[i,"Exp"], 
+                                         to = exposures[i,"Func"], 
+                                         start_date = date, 
+                                         end_date = date)[,2]
+    if (exposures[i,'Amount'] < 0) {
+      pts = point_list[[paste(exposures[i,'Market.Convention'],exposures[i,'Func'],'Sell')]]
+      if (length(pts) > 0) {
+        exposures[i,'Pts'] = pts
+        exposures[i,'HedgeNotional'] = abs(ex_rate*exposures[i,"Amount"])
+        exposures[i, "TransType"] = "Sell"
+        exposures[i, "HedgeCurrency"] = exposures[i,'Func']
+      }
+    }
+    else {
+      pts = point_list[[paste(exposures[i,'Market.Convention'],exposures[i,'Func'],'Buy')]]
+      if (length(pts) > 0) {
+        exposures[i,'Pts'] = pts
+        exposures[i,'HedgeNotional'] = abs(ex_rate*exposures[i,"Amount"])
+        exposures[i, "TransType"] = "Buy"
+        exposures[i, "HedgeCurrency"] = exposures[i,'Func']
+  }
+  }
+  }
+}
+```
+
+```{r}
+# Identify the unique currencies in which the hedges are denominated 
+hedge_cur = unique(exposures$HedgeCurrency)
+
+# pull the historical exchange rates between exposure and USD 
+hedge.usd.rates = c()
+for (i in hedge_cur){
+  rate = historical_exchange_rates(from = i, 
+                                   to = "USD", 
+                                   start_date = date, 
+                                   end_date = date)
+  
+  # Append the rate value to the rates list
+  hedge.usd.rates[i] = rate[,2]
+}
+
+# create a df to merge on 'from'
+hedge.usd = as.data.frame(hedge.usd.rates)
+hedge.usd = cbind(from = rownames(hedge.usd), hedge.usd)
+rownames(hedge.usd) = 1:nrow(hedge.usd)
+```
+
+```{r}
+# merge hedge.usd with exposures 
+exposures = full_join(exposures, hedge.usd, by = join_by(HedgeCurrency == from))
+```
+
+```{r}
+# Calculate the USD equivalent for each hedge notional
+exposures$HedgeNotUSD = (exposures$HedgeNotional*exposures$hedge.usd.rates)
+```
+
+```{r}
+# Cost to hedge everything
+sum(na.omit(exposures$HedgeNotUSD)*na.omit(exposures$Pts))
+```
+
+```{r}
+# Here, we pull 2 years of historical exchange rates for currency pairs that appear on the Balance Sheet
+# set the end date
+end = Sys.Date()
+
+# set the start date
+start = Sys.Date() - years(2)
+  
+# for every exposure in the exposures dataframe
+for (row in 1:nrow(exposures)){
+
+  # pull the historical exchange rates between local and exposure currency between start and end date
+  rate = historical_exchange_rates(from = exposures[row, "FromCurr"], 
+                                   to = exposures[row, "ToCurr"], 
+                                   start_date = start, 
+                                   end_date = end)
+  
+  if (row == 1) {
+    rate_df = data.frame(rate[,2])
+    colnames(rate_df) = c(exposures[row, "Market.Convention"])
+  }
+  if (exposures[row, "Market.Convention"] %in% colnames(rate_df) & row != 1) {
+    mktconv = exposures[row, "Market.Convention"]
+    rate_df[paste(mktconv,"*", sep = "")] = rate[,2]
+  }
+  else {
+    mktconv = exposures[row, "Market.Convention"]
+    rate_df[mktconv] = rate[,2]
+  }
+}
+```
+
+```{r}
+# generate the log daily returns of the currency pair exchange rates
+returns = data.frame(sapply(rate_df[1:ncol(rate_df)], function(x) diff(log(x))))
+
+# generate a covariance matrix of the log daily returns
+covReturns = cov(returns)
+
+cor_matrix = as.data.frame(cor(returns))
+M = cor(returns)
+```
+
+
+```{r}
+# a vector of means for the multivariate set of ccyp
+meanReturns = colMeans(returns)
+
+all(eigen(covReturns)$values > 0)
+reg_covReturns = covReturns + diag(rep(0.0001, ncol(covReturns)))
+all(eigen(reg_covReturns)$values > 0)
+```
+
+**Issue with trying to optimize over an integral, which is what cvar package ES() function does using numerical integration (see documentation).**
+```{r}
+rets = as.vector(t(weights) %*% t(returns))
+
+hist(rets, breaks = 50)
+abline(v = 2*sd(rets))
+skewness(rets)
+kurtosis(rets)
+
+variance = t(weights) %*% reg_covReturns %*% weights
+ERp = mean(rets)
+SDp = sqrt(variance) # look into other ways to scale variance of portfolios t time periods in the future
+rets_dist = (rnorm(100000, ERp, SDp))
+
+hist(rets_dist)
+abline(v = 2*SDp)
+skewness(rets_dist)
+kurtosis(rets_dist)
+```
+
+#### Genetic Algorithm Optimization of Hedge Ratios Using CVaR
+```{r}
+alpha = 0.05
+budget = 10000
+maxLoss = 18000000
+### See derivation sheet ###
+amt = exposures$HedgeNotUSD # 
+fwd_points = exposures$Pts # forward points ### removed -1* ###
+exp = exposures$expusd # exposures (USD)
+n = length(exp)
+# weights function
+weights_func = function(e, h){
+    w = e*(1-h) / sum(e*(1-h))
+    return(w)
+}
+# cost function
+cost_func = function(h) {
+    c = sum(amt * h * fwd_points)
+    return(c)
+}
+# total net exposure function
+sum_net_exp_func = function(e, h) {
+  sum_net_exp = sum(e*(1-h))
+  return(sum_net_exp)
+}
+#CVaR function
+cvar_func = function(r, w, cov, alpha){
+  # create the portfolio distribution
+  daily_returns = t(w) %*% t(r)
+  daily_variance = t(w) %*% cov %*% w
+  ERp = ((1 + mean(daily_returns))^30 - 1)
+  SDp = sqrt(daily_variance*30) # look into other ways to scale variance of portfolios t time periods in the future
+  set.seed(1234)
+  rets_dist = (rnorm(100000, ERp, SDp)) # random generation for the normal distribution
+  set.seed(NULL)
+  cvar = ES(rets_dist, 0.05, pdf) # take the mean of the worst 5% of portfolio returns
+  return(-cvar) 
+}
+```
+
+
+### Genetic Algorithm
+```{r}
+lower = rep(0,103)
+upper = rep(1,103)
+h = rep(0, 103)
+
+ga_obj_func = function(h) {
+  w = weights_func(exp, h)
+  pen = sqrt(.Machine$double.xmax)
+  if (cost_func(h) <= -budget) {
+    cost = cost_func(h) * pen
+  }
+  else {
+    cost = cost_func(h)
+  }
+  sum_exp = sum_net_exp_func(exp, h)
+  cvar = cvar_func(returns, w, reg_covReturns, alpha)
+  if (sum_exp * cvar <= -maxLoss) {
+    cvarll = sum_exp * cvar * pen
+  }
+  if (sum_exp * cvar > 0) {
+    cvarll = sum_exp * cvar * -pen
+  }
+  else {
+    cvarll = sum_exp * cvar
+  }
+  obj = cost + cvarll
+  return(obj)
+}
+```
+
+```{r}
+start_t = Sys.time()
+ga_output = ga(type = "real-valued",
+               fitness = ga_obj_func, 
+               lower = lower,
+               upper = upper,
+               maxiter = 2000,
+               keepBest = TRUE,
+               monitor = FALSE,
+               popSize = 150,
+               pmutation = 0.25,
+               maxFitness = 0)
+end_t = Sys.time()
+
+print(end_t-start_t)
+
+optimal_sol = c(ga_output@solution)
+
+optimal_exp = sum_net_exp_func(exp, optimal_sol)
+optimal_cvar = cvar_func(returns, weights_func(exp, optimal_sol), reg_covReturns, alpha)
+optimal_weights = weights_func(exp, optimal_sol)
+optimal_cost = cost_func(optimal_sol)
+optimal_cvarll = optimal_cvar*optimal_exp
+optimal_cor = optimal_cost + optimal_cvarll
+
+print(optimal_exp)
+print(optimal_cvar)
+print(optimal_cost)
+print(optimal_cvarll)
+print(optimal_cor)
+```
+
+```{r}
+plot(ga_output)
+```
+
+```{r}
+iterSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+colnames(iterSols)[1:5] = c('Exposure', 'CVaR', 'CoH','CVaRLL', 'CoR')
+colnames(iterSols)[6:(n+5)] = colnames(rate_df)
+
+allSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+colnames(allSols)[1:5] = c('CVaR', 'NetExposure', 'CoH','CVaRLL', 'CoR')
+colnames(allSols)[6:(n+5)] = colnames(rate_df)
+```
+
+```{r}
+iterSols[1,] = c(optimal_exp, optimal_cvar, optimal_cost, optimal_cvarll, optimal_cor, optimal_sol)
+```
+
+```{r}
+iterSols
+```
+
+```{r}
+for (i in 1:length(ga_output@bestSol)) {
+  allSols[i,6:(n+5)] = ga_output@bestSol[[i]][1,]
+}
+
+for (i in 1:nrow(allSols)) {
+  allSols[i, "CVaR"] = cvar_func(returns, weights_func(exp, t(allSols[i,6:(n+5)])), reg_covReturns, alpha)
+  allSols[i, "NetExposure"] = sum_net_exp_func(exp, t(allSols[i,6:(n+5)]))
+  allSols[i, "CoH"] = cost_func(t(allSols[i,6:(n+5)]))
+  allSols[i, "CVaRLL"] = allSols[i, "CVaR"]*allSols[i, "NetExposure"]
+  allSols[i, "CoR"] = allSols[i, "CoH"] + allSols[i, "CVaRLL"]
+}
+```
+
+```{r}
+allSols
+```
+
+```{r}
+df = data.frame(index = 1:nrow(allSols))
+df = cbind(df, allSols[,c(3,4)])
+```
+
+```{r}
+plot(1:n, t(c(iterSols[,6:ncol(iterSols)])), main = "Hedge Ratios from Genetic Algorithm",
+     xlab = "Exposure Index", ylab = "Hedge Ratio", yaxt = "n", col = "black", lwd = 2)
+axis(2, at = c(0,0.2,0.4,0.6,0.8,1) , labels = c("0%","20%","40%","60%","80%", "100%"), las = 1)
+```
+
+```{r}
+plot(1:n, rep(1,103), main = "Hedge Ratios of Current Strategy",
+     xlab = "Exposure Index", ylab = "Hedge Ratio", yaxt = "n", ylim = c(0,1.1), col = "black", lwd = 2)
+axis(2, at = c(0,0.2,0.4,0.6,0.8,1) , labels = c("0%","20%","40%","60%","80%", "100%"), las = 1)
+```
+
+```{r}
+corgif = ggplot(df, aes(-CoH,-CVaRLL)) +
+  geom_point() +
+  theme_classic() +
+  # gganimate specific bits:
+  labs(title = 'Cost of Risk', x = 'Cost of Hedge', y = 'CVaR (Millions)') +
+  geom_hline(yintercept = 8000000, linetype = "dashed", color = "red")+
+  geom_vline(xintercept = 250000, linetype = "dashed", color = "blue")+
+  scale_x_continuous(breaks = c(250000,300000,350000,400000,450000), labels = c("$250,000","$300,000","$350,000","$400,000","$450,000"))+
+  scale_y_continuous(breaks = c(5000000,6000000,7000000,8000000), labels = c("$5","$6","$7","$8"))+
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14),
+        title=element_text(size=16))+
+  transition_time(index) +
+  ease_aes('linear')
+
+# Save at gif:
+animate(corgif, duration = 10, fps = 30, width = 400, height = 300, renderer = gifski_renderer())
+anim_save("CoR.gif")
+```
+
+```{r}
+exposures$HedgeRatio = c(t(iterSols[,6:ncol(iterSols)]))
+```
+
+```{r}
+op_daily_returns = t(weights_func(exp, exposures$HedgeRatio)) %*% t(returns)
+op_daily_variance = t(weights_func(exp, exposures$HedgeRatio)) %*% reg_covReturns %*% weights_func(exp, exposures$HedgeRatio)
+op_ERp = ((1 + mean(op_daily_returns))^30 - 1)
+op_SDp = sqrt(op_daily_variance*30) # look into other ways to scale variance of portfolios t time periods in the future
+rets_dist = (rnorm(100000, op_ERp, op_SDp))
+hist(optimal_exp*rets_dist, breaks = 50, main = "Distribution of returns for Hedged Portfolio",
+     xlab = "Returns")
+abline(v = optimal_cvarll, col = "red")
+```
+
+```{r}
+cur = rep(-571000, 120)
+total_cur = c()
+for (i in 1:length(cur)) {
+  total_cur[i] = sum(cur[1:i])
+}
+
+rec = rep(optimal_cost, 120)
+
+mcreps = 1000
+mc_rec = data.frame(matrix(0, nrow = 0, ncol = 120))
+for (i in 1:mcreps) {
+  variation = optimal_exp * rnorm(120, op_ERp, op_SDp)
+  rec_var = rec + variation
+  total_rec = c()
+  for (j in 1:length(rec_var)) {
+    total_rec[j] = sum(rec_var[1:j])
+  }
+  mc_rec[i,] = total_rec
+}
+
+mc_rec = mc_rec[order(mc_rec$X120, decreasing = T),]
+row.names(mc_rec) = NULL
+
+mc_rec25 = mc_rec[1:(mcreps*0.25),]
+mc_rec50 = mc_rec[((mcreps*0.25)+1):(mcreps*0.75),]
+mc_rec75 = mc_rec[((mcreps*0.75)+1):mcreps,]
+
+ga25 = colMeans(mc_rec25)
+ga50 = colMeans(mc_rec50)
+ga75 = colMeans(mc_rec75)
+
+ga25_avg = prettyNum(round(ga25[120],7), big.mark = ",")
+ga50_avg = prettyNum(round(ga50[120],7)*-1, big.mark = ",")
+ga75_avg = prettyNum(round(ga75[120],7)*-1, big.mark = ",")
+
+plot(1:120, total_cur/1000000, col = "#0078be", type = "l", lwd = 3, xlim = c(0,145),
+     ylim = c(-120, 70), main = "10 Year Total Cost of Risk Projection",
+     xlab = "Months", ylab = "Total Cost (Millions)", yaxt = "n")
+lines(1:120, ga25/1000000, type = "l", lwd = 3, col = "green4")
+lines(1:120, ga50/1000000, type = "l", lwd = 3, col = "gray2")
+lines(1:120, ga75/1000000, type = "l", lwd = 3, col = "red")
+axis(2, at = c(0,-50,-100), labels = c("$0", "-$50", "-$100"), las = 1)
+legend("bottomleft", c("Current Strategy", "Best Case Genetic Algorithm", "Most Likely Genetic Algorithm", "Worst Case Genetic Algorithm"), col=c("#0078be", "green4", "gray2", "red"), lty=1, cex=0.8, lwd = 2)
+text(135, -118, labels = "-$120,000,000")
+text(135, ga25[120]/1000000, labels = glue("${ga25_avg}"))
+text(135, ga50[120]/1000000, labels = glue("-${ga50_avg}"))
+text(135, ga75[120]/1000000, labels = glue("-${ga75_avg}"))
+abline(h = 0)
+```
+
+```{r}
+hist(array(mc_rec[,120]), breaks = 50, main = "Distribution of Projected Cost of Risk", xlab = "Cost (Millions)", las = 1, xaxt = "n", xlim = c(-120000000, 60000000))
+axis(1, at = c(-120000000, -100000000, -80000000, -60000000, -40000000, -20000000, 0 , 20000000, 40000000, 60000000), labels = c("-120","-100","-80", "-60", "-40", "-20", "0", "20", "40", "60"))
+abline(v = mean(array(mc_rec[,120])), lwd =2, col = "red")
+abline(v = -(571000*120), lwd = 10, col = "#0078be")
+legend("topright", c("Current Strategy", "Mean Cost Genetic Algorithm"), fill = c("#0078be", "red"), cex = 0.8)
+```
+
+```{r}
+HedgeTrans = data.frame(matrix(0, nrow = n, ncol = 6))
+colnames(HedgeTrans) = c("Market.Conv", "Dealt.CCY", "B.S", "HedgeAmount", "Pts", "CoH")
+for (i in 1:nrow(exposures)) {
+  HedgeTrans[i, 1] = exposures[i,"Market.Convention"]
+  HedgeTrans[i, 2] = exposures[i,"HedgeCurrency"]
+  HedgeTrans[i, 3] = exposures[i,"TransType"]
+  HedgeTrans[i, 4] = exposures[i,"HedgeNotional"]*exposures[i, "HedgeRatio"]
+  HedgeTrans[i, 5] = exposures[i,"Pts"]
+  HedgeTrans[i, 6] = exposures[i,"HedgeNotUSD"]*exposures[i, "HedgeRatio"]*exposures[i,"Pts"]
+}
+```
+
+```{r}
+write.csv(HedgeTrans, "transactions.csv", row.names = F)
+```
+
+```{r}
+base_ratios = rep(1, 103)
+base_exps = exp * (1-base_ratios)
+base_CoH = sum(amt * base_ratios * fwd_points)
+base_CoR = base_CoH
+
+base_CoH
+base_CoR
+```
+
+```{r}
+nh_ratios = rep(0, 103)
+nh_exps = sum_net_exp_func(exp, nh_ratios)
+nh_wts = weights_func(exp, nh_ratios)
+nh_cvar = cvar_func(returns, weights_func(exp, nh_wts), reg_covReturns, alpha)
+nh_cvarLL = sum(nh_exps) * nh_cvar
+nh_CoH = sum(amt * nh_ratios * fwd_points)
+nh_CoR = nh_cvarLL + nh_CoH
+
+nh_cvar
+nh_cvarLL
+nh_CoH
+nh_CoR
+```
+
+```{r}
+op_ratios = exposures$HedgeRatio
+op_exps = sum_net_exp_func(exp, op_ratios)
+op_wts = weights_func(exp, op_ratios)
+op_cvar = cvar_func(returns, op_wts, reg_covReturns, alpha)
+op_cvarLL = sum(op_exps) * op_cvar
+op_CoH = sum(amt * op_ratios * fwd_points)
+op_CoR = op_cvarLL + op_CoH
+
+op_cvar
+op_cvarLL
+op_CoH
+op_CoR
+```
+
+```{r}
+oc = prettyNum(round(iterSols[nrow(iterSols),"CVaRLL"]*-1, 0), big.mark = ",")
+ocoh = prettyNum(round(iterSols[nrow(iterSols),"CoH"]*-1, 0), big.mark = ",")
+```
+
+```{r}
+x = -allSols$CoH
+y = -allSols$CVaRLL
+plot(x, y, 
+     main = "Cost of Risk",
+     xlab = "Cost of Hedge",
+     ylab = "CVaR (Millions)",
+     xlim = c(-200000,700000),
+     ylim = c(0,35000000),
+     xaxt = "n", yaxt = "n")
+axis(1, at = c(-200000,0,200000,400000,600000), labels = c("-$200,000","$0","$200,000","$400,000","$600,000"))
+axis(2, at = c(0,10000000,20000000,30000000), labels = c("$0","$10","$20","$30"), las = 1)
+abline(v = budget, col = "blue3", lty = 2, lwd = 2)
+abline(h = maxLoss, col = "red2", lty = 2, lwd = 2)
+points(-base_CoH, 0, col = "blue", lwd = 5)
+points(-nh_CoH, -nh_cvarLL, col = "red", lwd = 5)
+points(-op_CoH, -op_cvarLL, col = "green", lwd = 5)
+text(budget+125000, 25000000, labels = "Budget: $250,000", col = "blue3")
+text(-20000, maxLoss+1200000, labels = "Max CVaR: $8,000,000", col = "red2")
+text(-base_CoH+70000, 0, labels = "Current")
+text(-nh_CoH+100000, -nh_cvarLL, labels = "No Hedging")
+text(-op_CoH-130000, -op_cvarLL, 
+labels = glue("Optimal Hedging
+CVaR: ${oc}
+CoH: ${ocoh}"))
+```
+
+```{r}
+x = -allSols$CoH
+y = -allSols$CVaRLL
+plot(x, y, 
+     main = "Cost of Risk",
+     xlab = "Cost of Hedge",
+     ylab = "CVaR (Millions)",
+     xlim = c(0,700000),
+     xaxt = "n", yaxt = "n")
+axis(1, at = c(200000,300000,400000,500000,600000,700000), labels = c("$200,000","$300,000","$400,000","$500,000","$600,000","$700,000"))
+axis(2, at = c(5000000,6000000,7000000,8000000), labels = c("$5","$6","$7","$8"), las = 1)
+abline(v = budget, col = "blue3", lty = 2, lwd = 2)
+abline(h = maxLoss, col = "red2", lty = 2, lwd = 2)
+points(-op_CoH, -op_cvarLL, col = "green", lwd = 5)
+text(-op_CoH+65000, - op_cvarLL, labels = "Optimal Hedging")
+text(budget+65000, 7000000, labels = "Budget: $250,000", col = "blue3")
+text(575000, maxLoss-200000, labels = "Max CVaR: $8,000,000", col = "red2")
+```
+
+# Hypothesis Testing
+```{r}
+exp1Sols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+colnames(exp1Sols)[1:5] = c('Exposure', 'CVaR', 'CoH','CVaRLL', 'CoR')
+colnames(exp1Sols)[6:(n+5)] = colnames(rate_df)
+
+for (i in 1:30) {
+  niters = 1
+  
+  iterSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+  colnames(iterSols)[1:5] = c('Exposure', 'CVaR', 'CoH','CVaRLL', 'CoR')
+  colnames(iterSols)[6:(n+5)] = colnames(rate_df)
+  
+  allSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+  colnames(allSols)[1:n] = colnames(rate_df)
+  colnames(allSols)[(n+1):(n+5)] = c('CVaR', 'NetExposure', 'Cost','CVaRLoss', 'CoR')
+  
+  
+  for (i in 1:niters) {
+    ga_output = ga(type = "real-valued",
+     fitness = ga_obj_func, 
+     lower = lower,
+     upper = upper,
+     maxiter = 1500,
+     keepBest = TRUE,
+     monitor = FALSE)
+    
+    optimal_sol = c(ga_output@solution)
+    
+    optimal_exp = sum_net_exp_func(exp, optimal_sol)
+    optimal_cvar = cvar_func(returns, weights_func(exp, optimal_sol), reg_covReturns, alpha)
+    optimal_weights = weights_func(exp, optimal_sol)
+    optimal_cost = cost_func(optimal_sol)
+    optimal_cvarll = optimal_cvar*optimal_exp
+    optimal_cor = optimal_cost + optimal_cvarll
+  
+    iterSols[i,] = c(optimal_exp, optimal_cvar, optimal_cost, optimal_cvarll, optimal_cor, optimal_sol)
+  }
+  
+  exp1Sols = rbind(exp1Sols, iterSols)
+}
+```
+
+```{r}
+exp1Sols
+```
+
+```{r}
+exp2Sols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+colnames(exp2Sols)[1:5] = c('Exposure', 'CVaR', 'CoH','CVaRLL', 'CoR')
+colnames(exp2Sols)[6:(n+5)] = colnames(rate_df)
+
+for (i in 1:30) {
+  niters = 5
+  
+  iterSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+  colnames(iterSols)[1:5] = c('Exposure', 'CVaR', 'CoH','CVaRLL', 'CoR')
+  colnames(iterSols)[6:(n+5)] = colnames(rate_df)
+  
+  allSols = data.frame(matrix(0, nrow = 0, ncol = n+5))
+  colnames(allSols)[1:n] = colnames(rate_df)
+  colnames(allSols)[(n+1):(n+5)] = c('CVaR', 'NetExposure', 'Cost','CVaRLoss', 'CoR')
+  
+  
+  for (i in 1:niters) {
+    ga_output = ga(type = "real-valued",
+     fitness = ga_obj_func, 
+     lower = lower,
+     upper = upper,
+     maxiter = 300,
+     keepBest = TRUE,
+     monitor = FALSE)
+    
+    optimal_sol = c(ga_output@solution)
+    
+    optimal_exp = sum_net_exp_func(exp, optimal_sol)
+    optimal_cvar = cvar_func(returns, weights_func(exp, optimal_sol), reg_covReturns, alpha)
+    optimal_weights = weights_func(exp, optimal_sol)
+    optimal_cost = cost_func(optimal_sol)
+    optimal_cvarll = optimal_cvar*optimal_exp
+    optimal_cor = optimal_cost + optimal_cvarll
+  
+    iterSols[i,] = c(optimal_exp, optimal_cvar, optimal_cost, optimal_cvarll, optimal_cor, optimal_sol)
+  }
+  best = filter(iterSols, CoR == max(CoR))
+  
+  exp2Sols = rbind(exp2Sols, best)
+}
+```
+
+```{r}
+exp2Sols
+```
+
+```{r}
+t.test(exp1Sols$CoR, exp2Sols$CoR)
+```
+
+
+
+
